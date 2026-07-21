@@ -28,3 +28,6 @@ FastAPI、LangChain、Chroma、BM25、BGE-Reranker、SSE流式通信、Python、
 
 4\. 打开demo.html访问问答页面
 
+
+注意：本地需要预先部署 Ollama，在Ollama上面下载对应大模型，然后拉取对应的 Embedding 模型与大模型。注意端口是否要修改
+
