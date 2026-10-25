@@ -1,56 +1,125 @@
+import os
+
+# 国内镜像源，与后端保持一致
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+
+import torch
 from langchain_ollama import OllamaEmbeddings
 from langchain_chroma import Chroma
-from rank_bm25 import BM25Okapi
-import jieba
+from transformers import AutoModelForMaskedLM, AutoTokenizer
 from sentence_transformers import CrossEncoder
+from typing import List
 
 # ========== 1. 加载向量库、嵌入模型 ==========
 embeddings = OllamaEmbeddings(
     model="bge-m3",
     base_url="http://localhost:11434",
 )
-
 vectorstore = Chroma(
     persist_directory="./chroma_db",
-    embedding_function=embeddings,
     collection_name="rag_knowledge",
+    embedding_function=embeddings,
 )
 
-# ========== 2. 复用你sse_server里的混合检索、Reranker逻辑（和后端保持一致） ==========
-# 加载全部文档构建BM25
+# ========== 2. SPLADE 稀疏语义检索模块（与 sse_server 完全对齐） ==========
+SPLADE_MODEL_NAME = "naver/splade-cocondenser-ensembledistil"
+SPLADE_MAX_LENGTH = 512
+SPLADE_BATCH_SIZE = 8
+
+print("正在加载 SPLADE 稀疏检索模型...")
+splade_tokenizer = AutoTokenizer.from_pretrained(SPLADE_MODEL_NAME)
+splade_model = AutoModelForMaskedLM.from_pretrained(SPLADE_MODEL_NAME)
+splade_model.eval()
+if torch.cuda.is_available():
+    splade_model = splade_model.cuda()
+    print("SPLADE 模型已加载至 GPU")
+
+
+def splade_encode(texts: List[str]) -> List[dict]:
+    """用 SPLADE 模型批量生成稀疏向量（词权重字典）"""
+    inputs = splade_tokenizer(
+        texts,
+        padding=True,
+        truncation=True,
+        max_length=SPLADE_MAX_LENGTH,
+        return_tensors="pt"
+    )
+    if torch.cuda.is_available():
+        inputs = {k: v.cuda() for k, v in inputs.items()}
+
+    with torch.no_grad():
+        output = splade_model(**inputs)
+
+    # SPLADE 标准计算：log(1 + relu(logits)) + max pooling
+    scores = torch.log1p(torch.relu(output.logits))
+    scores = torch.max(scores, dim=1).values  # [batch_size, vocab_size]
+
+    # 转为稀疏字典，过滤零权重
+    sparse_vectors = []
+    for i in range(scores.shape[0]):
+        nonzero_idx = torch.nonzero(scores[i]).squeeze(1)
+        nonzero_val = scores[i][nonzero_idx]
+        vec_dict = {int(idx): float(val) for idx, val in zip(nonzero_idx, nonzero_val)}
+        sparse_vectors.append(vec_dict)
+    return sparse_vectors
+
+
+def sparse_dot_product(query_vec: dict, doc_vec: dict) -> float:
+    """计算两个稀疏向量的点积相似度"""
+    score = 0.0
+    for token_id, weight in query_vec.items():
+        score += weight * doc_vec.get(token_id, 0.0)
+    return score
+
+
+# 构建全量文档稀疏索引
+print("正在构建文档 SPLADE 稀疏索引...")
 all_data = vectorstore._collection.get(include=["documents"])
 all_docs = all_data["documents"]
 all_ids = all_data["ids"]
-tokenized_corpus = [list(jieba.cut(doc)) for doc in all_docs]
-bm25 = BM25Okapi(tokenized_corpus)
 
-# 加载Reranker重排序模型
+# 批量生成稀疏向量，避免显存溢出
+all_sparse_vectors = []
+for i in range(0, len(all_docs), SPLADE_BATCH_SIZE):
+    batch = all_docs[i:i + SPLADE_BATCH_SIZE]
+    all_sparse_vectors.extend(splade_encode(batch))
+
+print(f"SPLADE 索引构建完成，共 {len(all_docs)} 条文档")
+
+# ========== 3. 加载 Reranker 重排序模型 ==========
 reranker_model = CrossEncoder("BAAI/bge-reranker-base")
 
-# 混合检索函数（粗排，返回top20）
+
+# ========== 4. 混合检索函数（稠密向量 + SPLADE 稀疏语义） ==========
 def hybrid_search(query: str, top_k: int = 20):
-    # 向量检索
+    """混合检索：稠密向量深层语义 + SPLADE稀疏语义，合并去重"""
+    # 第一路：稠密向量检索（bge-m3）
     vector_results = vectorstore.similarity_search(query, k=top_k)
     vector_texts = [doc.page_content for doc in vector_results]
-    # BM25检索
-    tokenized_query = list(jieba.cut(query))
-    bm25_scores = bm25.get_scores(tokenized_query)
-    top_indices = sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)[:top_k]
-    bm25_texts = [all_docs[i] for i in top_indices]
-    # 合并去重
+
+    # 第二路：SPLADE 稀疏语义检索
+    query_sparse = splade_encode([query])[0]
+    scores = [sparse_dot_product(query_sparse, doc_vec) for doc_vec in all_sparse_vectors]
+    top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
+    splade_texts = [all_docs[i] for i in top_indices]
+
+    # 合并两路结果，去重
     seen = set()
     merged = []
     for text in vector_texts:
         if text not in seen:
             seen.add(text)
             merged.append(text)
-    for text in bm25_texts:
+    for text in splade_texts:
         if text not in seen:
             seen.add(text)
             merged.append(text)
+
     return merged[:top_k]
 
-# Reranker重排序函数
+
+# ========== 5. Reranker 重排序函数 ==========
 def rerank(query: str, docs: list, top_k: int = 3):
     pairs = [[query, doc] for doc in docs]
     scores = reranker_model.predict(pairs)
@@ -58,6 +127,7 @@ def rerank(query: str, docs: list, top_k: int = 3):
     # 按分数从高到低排序
     scored_docs.sort(key=lambda x: x[1], reverse=True)
     return scored_docs[:top_k]
+
 
 # ========== 测试用例 ==========
 test_cases = [
@@ -83,12 +153,12 @@ test_cases = [
      ["torch", "torch.nn", "torch.utils.data"]),
 ]
 
-# ========== 测试函数：对比【仅向量top5】 vs 【混合粗排+Reranker精排top3】 ==========
-def test_recall():
-    vec_hit_count = 0       # 仅向量检索top5 命中数
-    rerank_hit_count = 0    # 混合+Reranker精排top3 命中数
-    results = []
 
+# ========== 测试函数：对比【仅向量top5】 vs 【SPLADE混合粗排+Reranker精排top3】 ==========
+def test_recall():
+    vec_hit_count = 0  # 仅向量检索top5 命中数
+    rerank_hit_count = 0  # SPLADE混合+Reranker精排top3 命中数
+    results = []
     for question, keywords in test_cases:
         print(f"\n==================== 测试问题：{question} ====================")
         # 1. 纯向量top5 原始召回
@@ -98,7 +168,7 @@ def test_recall():
         if vec_hit:
             vec_hit_count += 1
 
-        # 2. 混合粗排20条 + Reranker打分重排，取top3
+        # 2. SPLADE混合粗排20条 + Reranker打分重排，取top3
         raw_20_docs = hybrid_search(question, top_k=20)
         rerank_top3 = rerank(question, raw_20_docs, top_k=3)
 
@@ -127,10 +197,11 @@ def test_recall():
 
     # 汇总打印召回率对比
     print("\n" + "=" * 100)
-    print(f"召回率对比测试汇总")
+    print(f"召回率对比测试汇总（SPLADE 版本）")
     print(f"总测试用例：{len(test_cases)}")
     print(f"1. 仅向量检索 top5  | 命中数：{vec_hit_count} | 召回率：{vec_hit_count / len(test_cases) * 100:.1f}%")
-    print(f"2. 混合检索+Reranker精排 top3 | 命中数：{rerank_hit_count} | 召回率：{rerank_hit_count / len(test_cases) * 100:.1f}%")
+    print(
+        f"2. SPLADE混合检索+Reranker精排 top3 | 命中数：{rerank_hit_count} | 召回率：{rerank_hit_count / len(test_cases) * 100:.1f}%")
     print("=" * 100)
 
     # 逐条打印详细对比
@@ -141,11 +212,13 @@ def test_recall():
         print(f"\n{i}. 问题：{r['question']}")
         print(f"   关键词：{r['keywords']}")
         print(f"   纯向量top5：{vec_status} | top1片段：{r['vec_top1_preview']}")
-        print(f"   混合+Reranker top3：{rerank_status} | top1分数：{r['rerank_top1_score']:.4f} | top1片段：{r['rerank_top1_text']}")
+        print(
+            f"   SPLADE混合+Reranker top3：{rerank_status} | top1分数：{r['rerank_top1_score']:.4f} | top1片段：{r['rerank_top1_text']}")
 
     vec_rate = vec_hit_count / len(test_cases)
     rerank_rate = rerank_hit_count / len(test_cases)
-    print(f"\n【总结】Reranker优化后召回率变化：{rerank_rate*100:.1f}%（原{vec_rate*100:.1f}%），提升{(rerank_rate - vec_rate)*100:.1f}%")
+    print(
+        f"\n【总结】SPLADE方案召回率变化：{rerank_rate * 100:.1f}%（原纯向量{vec_rate * 100:.1f}%），提升{(rerank_rate - vec_rate) * 100:.1f}%")
     return vec_rate, rerank_rate
 
 
